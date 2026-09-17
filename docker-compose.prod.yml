@@ -1,0 +1,27 @@
+# 生产用：直接拉 GHCR 上的镜像，不在服务器上构建。
+# 用法见 README「GitHub 部署」一节。
+#
+# 首次使用先拉一次：
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  canary:
+    # 把 OWNER/REPO 换成你的仓库（GHCR 要求全小写）
+    image: ghcr.io/OWNER/REPO:latest
+    container_name: canary-image-probe
+    restart: unless-stopped
+    ports:
+      # 左边是宿主机端口，按需改。用 80 需要 root 或已放行
+      - "8080:8080"
+    volumes:
+      # 命中日志持久化到宿主机 ./data/canary_hits.jsonl
+      - ./data:/data
+    environment:
+      - CANARY_DATA=/data
+      - TZ=UTC
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

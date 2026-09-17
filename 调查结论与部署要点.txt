@@ -1,0 +1,172 @@
+一、判断 Azure 渠道还是 OpenAI 官方直连（GPT 源鉴定）
+
+目标：区分一条声称是 Azure 的 GPT 渠道，真实 serving 是不是微软侧，
+而不是「OpenAI 官方直连」或「普通兼容中转」。
+
+结论先行：没有任何单一响应字段能 100% 证明上游是谁，因为客户端看到的一切
+都要经过中转，中转可以把字段删掉或补上。所以用「判据组合 + 交叉验证」，
+按伪造成本从高到低排列，越靠前越可信。
+
+────────────────────────────────────────
+判据 1（最接近不可伪造）：越狱分类器决策
+────────────────────────────────────────
+原理：Azure 在模型运行之前用 Prompt Shields 判定 jailbreak，命中直接返回
+HTTP 400（error.code=content_filter），此时模型根本没跑，响应里没有任何
+completion 字段。OpenAI 官方没有这层，会 200 后由模型自己拒绝。
+
+实测（147ai 两个分组，同一 DAN 模板连打 6 次）：
+    openai 组： 200 finish=[stop] × 6，一次都没拦
+    azure  组： 400 × 5，200 × 1
+
+为什么难以伪造：这不是可复制的字符串，是一次真实分类器判定。我用随机生成
+的地名与伤亡数字拼了 5 条全新句子，azure 组仍能在其中一条上给出
+completion.violence=medium，openai 组 5 条全部无标注。预置映射表不可能命中
+随机句子，要复现这个行为只能真跑一套微软分类器。
+
+配套判据：severity 分级标注
+    中文样本同样生效：中文自伤求助 → p.self_harm=low, c.self_harm=low
+                      中文战地医院描写 → c.violence=medium
+    openai 组在全部 12 个样本（英/中、递增强度、版权、无害对照）上
+    恒为 filter_fields=False。
+    强度单调性：暴力主题四档为 [0,0,0,2]，自伤主题为 [0,0,1,0]，
+    不完美但「能给分级」本身已是能力证明。
+
+脚本：_tmp/unforge_oracle_consistency.py、_tmp/unforge_t8_t9.py、
+      _tmp/unforge_t10_nostream_filters.py
+
+────────────────────────────────────────
+判据 2：错误信封的包装差异
+────────────────────────────────────────
+同样触发非法参数，openai 组的报错带 "Provider API error: " 前缀，
+azure 组没有：
+
+    openai: {"error":{"message":"Provider API error: Invalid 'n': integer below ..."}}
+    azure : {"error":{"message":"Invalid 'n': integer below ..."}}
+
+8 个用例（n=0、temperature=9、top_p=-1、bad_role、freq_pen、tool_bad_type 等）
+全部一致。说明两组报文出站前经过不同处理路径。
+
+脚本：见 _tmp 目录下的错误信封探针
+
+────────────────────────────────────────
+判据 3：流式 SSE 的 Azure 策略面与 serving 面
+────────────────────────────────────────
+只在 azure 组出现（10/10）：
+    1. choices[].content_filter_results
+       Azure AI Content Safety 分类法：hate/sexual/violence/self_harm + jailbreak，
+       另有 protected_material_code/protected_material_text，severity=safe
+    2. routing.serving_pipereplica
+       形如 d20260821200246-5e5e1867-default-r1-dp0-default
+    3. latency_checkpoint
+       engine_ttft_ms / service_ttft_ms / user_visible_ttft_ms / pre_inference_ms，
+       微软推理网格内部耗时分解，公开 Schema 里没有
+
+间歇出现（约 2/3 的请求）：
+    prompt_filter_results 空壳帧（id/model/object 为空、created=0、choices=[]），
+    只在 gpt-5.6-luna 上稳定出现，gpt-5 上没有 —— 不能当主判据
+
+旁证：azure 组 JSON 键是字母序，openai 组是声明序（id, object, created, model...）。
+      一旦中转重新序列化就没了，仅供参考。
+
+────────────────────────────────────────
+判据 4：内部 ID 的池化结构（真实后端 vs 随机编造）
+────────────────────────────────────────
+azure 组 8 次请求：
+    azureml-model-session 只落在 2 个值上（d20260805145903-5cddbabf × 7）
+    serving_pipereplica 落在 6 个值上，且成对出现 r1/r2
+    region 与 session 绑定（Sweden Central / East US 各自对应固定 session）
+
+伪造者要么每次编新的（重复率对不上），要么得维护一张与 region、served-model
+联动的 ID 表，等于维护真实部署清单。
+
+────────────────────────────────────────
+判据 5（软）：上游响应头泄漏
+────────────────────────────────────────
+只在非流式响应上出现。10/10 稳定：
+    azure 组：apim-request-id、x-ms-region（Sweden Central）、
+              azureml-model-session、x-ms-rai-invoked、x-ms-served-model、
+              x-ms-is-spilled-over、azureai-fe-*、skip-error-remapping、
+              x-ratelimit-key、x-ratelimit-renewalperiod-*、x-shellapi-request-id
+    openai 组：openai-organization、openai-project、openai-processing-ms、
+               openai-version、cf-ray 等；x-request-id 为 req_<32hex>
+    azure 组 x-request-id 为 UUID
+
+注意：响应头是中介完全控制的，加一行代码就能伪造或抹掉，只能当旁证，
+不要当主判据。
+
+────────────────────────────────────────
+判据 6：图片抓取金丝雀（真 100%，需要你侧资源）
+────────────────────────────────────────
+原理：把图片 URL 放进请求，上游会从自己的机房去拉这张图。已在服务器上放
+一张能看访问日志的图，日志里的抓取方来源 IP 就是不可伪造的证据。
+
+实测前提已确认（上游确实是自己在抓图，不是网关代抓转 base64）：
+    慢速 URL → openai 组 400 "Unable to download content from the provided
+               URL before the timeout"
+               azure 组 400 "Timed out while downloading image from ip:port"
+    404 URL  → openai 组 "Error while downloading file. Upstream status code: 404"
+               azure 组 "Failed to download image from ip:port"
+    非法格式 → openai "['png','jpeg','gif','webp']"
+               azure  "['gif','jpeg','webp','png']"（顺序不同）
+
+判读：
+    两组抓取 IP 不同，且 azure 组落在微软网络（AS8075）→ Azure 标签可信度高
+    两组抓取 IP 完全相同 → 共用同一出口，Azure 标签可疑
+    某组没有记录 → 该组没抓图（可能被网关改写为 base64，或渠道不支持图片输入）
+
+保留：OpenAI 自身有相当一部分算力跑在微软云上，所以「IP 属于微软 ASN」是
+强旁证不是铁证，要与判据 1 交叉验证，两条独立证据同向才站得住。
+
+工具：D:\canary-image-probe（Docker 部署，见二）
+
+────────────────────────────────────────
+已证伪 / 无效的判据（避免踩坑）
+────────────────────────────────────────
+· obfuscation 字段：原以为 OpenAI 独有，实测两组都 10/10 存在且非空，无鉴别力
+· system_fingerprint：两边都是 null
+· service_tier：两边都是 default
+· model 回显：两边都回 gpt-5-2025-08-07
+· max_tokens / stop 报错文案：两边逐字一致（同一套 serving 代码）
+· 请求侧参数探针：data_sources、user_security_context 两边都 200，
+  中转把未知字段吃掉了，用入参判断上游行不通
+· 限流头：突发 6 次出现 4999→499→499→4999 跳变，因为每组后面挂多个上游 key
+  在轮询，客户端看到的是多份配额交错，不可用
+· 前缀缓存：同一 4632 token 前缀连发两次，两组 cached_tokens 都是 0
+· API 资源端点：/v1/files、/v1/vector_stores、/v1/batches、/v1/assistants
+  全被 NewAPI 自己 404/400 掉，看不到上游
+· Responses 联网工具：两组都能返回真实 URL 引用，区分不开
+
+────────────────────────────────────────
+收敛后的判据优先级
+────────────────────────────────────────
+1. 图片抓取方 ASN（需要云服务器，真 100%）
+2. 越狱分类器决策 + severity 分级（随机未见样本上仍工作，最接近不可伪造）
+3. 错误信封 "Provider API error: " 前缀的有无
+4. 内部 ID 池化结构（session/replica 重复率与 region 联动）
+5. 响应头泄漏（软，仅作旁证）
+
+────────────────────────────────────────
+二、金丝雀图片落点项目（D:\canary-image-probe）
+────────────────────────────────────────
+结构：
+    server.py              落点服务，纯标准库，返回 1x1 合法 PNG，
+                           记录来源 IP / UA / 全部请求头，附 / 汇总接口
+    probe.py               测试端，读 .env 里的 base_url + key 发起请求，
+                           读回落点汇总并给出判读
+    Dockerfile             python:3.12-slim + 健康检查
+    docker-compose.yml     本地构建用，端口 8080，日志挂到 ./data
+    docker-compose.prod.yml 生产用，直接拉 GHCR 镜像
+    .github/workflows/build.yml  推 main/tag 时构建并推送 GHCR
+    README.md              部署与判读说明
+
+已验证：镜像构建通过，容器 Up (healthy)，容器内与宿主机端口映射都能取到
+合法 PNG（PIL 校验 70 字节 1x1 RGBA），日志正确落盘并能分辨来源 IP
+（容器内自测记 127.0.0.1，宿主机经映射访问记 172.20.0.1）。
+
+未完成：真实抓取方 IP 尚未拿到，因为本地落点从公网不可达；
+需要部署到云服务器后重跑。
+
+关键注意：
+  · 落点不要挂在 CDN / 反向代理后面，否则记到的是代理 IP，取证失效
+  · 安全组和系统防火墙都要放行端口
+  · 测试前清空 data/canary_hits.jsonl，避免旧记录混淆
