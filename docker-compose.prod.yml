@@ -7,8 +7,8 @@
 
 services:
   canary:
-    # 把 OWNER/REPO 换成你的仓库（GHCR 要求全小写）
-    image: ghcr.io/OWNER/REPO:latest
+    # GHCR 要求全小写
+    image: ghcr.io/maque-z/canary-image-probe:latest
     container_name: canary-image-probe
     restart: unless-stopped
     ports:
