@@ -16,37 +16,60 @@
     CANARY_DATA=/data python server.py    # 指定日志落盘目录（容器里用这个）
 
 接口：
-    GET  /canary?g=<tag>      返回 1x1 PNG，并记录请求方信息
-    GET  /                   健康检查，返回 JSON 统计
+    GET  /canary?g=<tag>      返回 PNG，并记录请求方信息
+    GET  /                   健康检查 + 实时汇总（JSON）
     POST /canary?g=<tag>      同上，兼容可能用 POST 的抓取器
 
 数据：
     所有命中追加写入 $CANARY_DATA/canary_hits.jsonl（默认 ./data/canary_hits.jsonl）
-    / 接口会实时汇总按 tag 与来源 IP 的聚合结果
 """
 import argparse
+import binascii
 import json
 import os
+import struct
 import sys
 import threading
+import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-# 1x1 合法 PNG（红色像素）。已用 PIL 校验可被解析，勿手改。
-PNG = bytes.fromhex(
-    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
-    "1f15c4890000000d4944415478da63f8cfc0f01f00050001ff57c72f0d"
-    "0000000049454e44ae426082"
-)
+
+def build_png(width=200, height=120, cell=20):
+    """运行时生成一张合法 PNG：粉白棋盘格。
+
+    为什么不内嵌 1x1 的小图：实测 1x1 的图虽然字节合法，但 Azure / OpenAI 两侧的
+    图片校验都会以 "You uploaded an unsupported image" 拒掉整个请求，探针就拿不到结果。
+    用这个尺寸两张都能正常识别。无外部依赖，不内嵌二进制。
+    """
+    rows = []
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", binascii.crc32(tag + data) & 0xFFFFFFFF))
+
+    for y in range(height):
+        line = bytearray(b"\x00")  # filter type 0
+        for x in range(width):
+            if ((x // cell) + (y // cell)) % 2 == 0:
+                line += bytes((255, 105, 180, 255))   # 粉
+            else:
+                line += bytes((255, 255, 255, 255))   # 白
+        rows.append(bytes(line))
+    raw = b"".join(rows)
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+
+
+PNG = build_png()
 
 DATA_DIR = os.environ.get("CANARY_DATA", "./data")
 LOG_PATH = os.path.join(DATA_DIR, "canary_hits.jsonl")
 LOCK = threading.Lock()
-
-# 判断抓取方归属时，优先看的请求头（有些抓取器会带，能辅助判断）
-UA_INTEREST = ("user-agent", "x-forwarded-for", "x-real-ip", "via", "x-ms-", "x-azure-",
-               "x-openai-", "openai-", "azure", "x-request-id", "apim-request-id")
 
 
 def utcnow():
@@ -98,8 +121,9 @@ def summarize(hits):
             by_ip[ip]["ua"].add(h["user_agent"][:120])
 
     verdict = "数据不足"
-    if len(by_tag) >= 2:
-        sets = [set(v.keys()) for v in by_tag.values()]
+    real = {t: v for t, v in by_tag.items() if t not in ("-", "selftest")}
+    if len(real) >= 2:
+        sets = [set(v.keys()) for v in real.values()]
         common = set.intersection(*sets) if sets else set()
         if common:
             verdict = f"两组共用出口 IP {sorted(common)}，Azure 标签可疑"
@@ -116,7 +140,7 @@ def summarize(hits):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "canary/2.0"
+    server_version = "canary/2.1"
     protocol_version = "HTTP/1.1"
 
     def _record(self, method):
@@ -146,11 +170,10 @@ class Handler(BaseHTTPRequestHandler):
             print(f"    XFF     : {entry['xff']}", flush=True)
         print(f"    UA      : {entry['user_agent']}", flush=True)
         for k, v in headers.items():
-            kl = k.lower()
-            if kl in ("user-agent", "host", "accept", "accept-encoding", "connection", "content-length"):
+            if k.lower() in ("user-agent", "host", "accept", "accept-encoding",
+                             "connection", "content-length"):
                 continue
-            if any(kl.startswith(p) or p in kl for p in UA_INTEREST) or True:
-                print(f"    {k}: {v[:130]}", flush=True)
+            print(f"    {k}: {v[:130]}", flush=True)
 
     def _send_png(self):
         self.send_response(200)
@@ -167,8 +190,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path in ("/", "/health", "/summary"):
-            hits = load_hits()
-            body = json.dumps(summarize(hits), ensure_ascii=False, indent=2).encode("utf-8")
+            body = json.dumps(summarize(load_hits()), ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -217,9 +239,9 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"金丝雀落点已启动: http://{args.host}:{args.port}/canary", flush=True)
+    print(f"图片尺寸: {len(PNG)} 字节", flush=True)
     print(f"日志: {os.path.abspath(LOG_PATH)}", flush=True)
     print(f"汇总: http://{args.host}:{args.port}/  (JSON)", flush=True)
-    print("把图片 URL 设为: http://<你的公网地址>/canary?g={tag}\n", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
